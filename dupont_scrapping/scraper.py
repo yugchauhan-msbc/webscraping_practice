@@ -9,7 +9,7 @@ import re
 import time
 from datetime import date
 
-from curl_cffi import requests as cf_requests
+import requests
 import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -25,29 +25,17 @@ LISTING_CONFIGS = [
     ('used', 'private'),
 ]
 
-# Exact dot-notation fields string captured from Network tab → Payload → View Source
+# Car-level fields only — aggregations omitted (they cause server timeout)
 _FIELDS = (
     'data.condition.code,'
-    'data.dealer.id,data.dealerId,data.dealer.preferredDealerStatus,'
-    'data.dealer.name,data.dealer.alias,data.dealer.logo,data.dealer.website,'
-    'data.updatedAt,data.createdAt,'
-    'data.vin,data.stock,data.certified,'
-    'data.locations.phone,data.locations.zipCode,data.locations.address,'
-    'data.locations.metro,data.locations.metroAlias,'
+    'data.dealer.name,data.dealerId,'
+    'data.vin,data.stock,'
     'data.mileage,data.mainImageUrl,data.id,data.year,data.price,'
-    'pagination.hasMore,pagination.nextCursor,pagination.total,'
+    'pagination.hasMore,pagination.total,'
     'data.brand.name,data.brand.alias,data.model.alias,data.model.name,'
-    'aggregations,filteredAggregations,'
     'data.locations.city,data.locations.state,'
-    'data.locations.geoPoint.lon,data.locations.geoPoint.lat,'
     'data.exteriorColor.name,data.interiorColor.name'
 )
-
-_AGGREGATIONS = [
-    'models:1000', 'brands:1000', 'summary', 'colors',
-    'conditions', 'transmissions', 'driveTrains',
-    'dealers:1000', 'listings', 'locations',
-]
 
 _GQL_QUERY = (
     'query ExecuteQuery2($queryName: String!, $fields: String!, $variables: String) {\n'
@@ -58,13 +46,20 @@ _GQL_QUERY = (
 _HEADERS = {
     'Content-Type':             'application/json',
     'Accept':                   'application/json, text/plain, */*',
+    'Accept-Language':          'en-US,en;q=0.9',
     'Origin':                   BASE,
     'Referer':                  f'{BASE}/cars-for-sale/{BRAND}/all?condition=used',
     'User-Agent':               (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
         'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/125.0.0.0 Safari/537.36'
+        'Chrome/149.0.0.0 Safari/537.36'
     ),
+    'sec-ch-ua':                '"Google Chrome";v="149", "Chromium";v="149", "Not/A)Brand";v="24"',
+    'sec-ch-ua-mobile':         '?0',
+    'sec-ch-ua-platform':       '"Windows"',
+    'sec-fetch-dest':           'empty',
+    'sec-fetch-mode':           'cors',
+    'sec-fetch-site':           'same-origin',
     'x-apollo-operation-name':  'ExecuteQuery2',
     'apollo-require-preflight': 'true',
 }
@@ -78,8 +73,8 @@ COLUMNS = [
 
 
 def _api_session():
-    """Impersonate Chrome's TLS fingerprint so Cloudflare lets the request through."""
-    s = cf_requests.Session(impersonate='chrome124')
+    """Plain requests session with full browser headers to pass Cloudflare checks."""
+    s = requests.Session()
     s.headers.update(_HEADERS)
     return s
 
@@ -98,12 +93,10 @@ def _parse_price(raw):
 def _build_inner_variables(condition, listing_type, offset):
     """Build the compact inner variables JSON string for one getCars page request."""
     return json.dumps({
-        'includes':             'brand,model,locations,dealer,condition',
-        'source':               'es',
-        'limit':                PAGE_SIZE,
-        'offset':               offset,
-        'filteredAggregations': _AGGREGATIONS,
-        'aggregations':         _AGGREGATIONS,
+        'includes': 'brand,model,locations,dealer,condition',
+        'source':   'es',
+        'limit':    PAGE_SIZE,
+        'offset':   offset,
         'filters': {
             'brandAlias':    {'in': [BRAND]},
             'conditionCode': {'eq': condition},
@@ -131,7 +124,16 @@ def _graphql_post(session, condition, listing_type, offset=0):
         },
         'query': _GQL_QUERY,
     }
-    resp = session.post(GQL_URL, json=payload, timeout=30)
+    for attempt in range(3):
+        try:
+            resp = session.post(GQL_URL, json=payload, timeout=60)
+            break
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise
+            wait = 10 * (attempt + 1)
+            log.warning('Timeout on attempt %d — retrying in %ds', attempt + 1, wait)
+            time.sleep(wait)
     resp.raise_for_status()
 
     outer = resp.json()

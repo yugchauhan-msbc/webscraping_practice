@@ -9,7 +9,7 @@ import re
 import time
 from datetime import date
 
-import cloudscraper
+from curl_cffi import requests as cf_requests
 import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -78,8 +78,8 @@ COLUMNS = [
 
 
 def _api_session():
-    """Create a cloudscraper session (requests-compatible, handles CF anti-bot automatically)."""
-    s = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows'})
+    """Impersonate Chrome's TLS fingerprint so Cloudflare lets the request through."""
+    s = cf_requests.Session(impersonate='chrome124')
     s.headers.update(_HEADERS)
     return s
 

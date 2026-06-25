@@ -1,0 +1,28 @@
+table: PIZZINT_WATCH
+
+columns:
+  - name: DataDate
+    type: DATE
+    primary_key: true
+
+  - name: Time
+    type: TIME
+    primary_key: true
+
+  - name: Section
+    type: VARCHAR
+    primary_key: true
+
+  - name: DataName
+    type: VARCHAR
+    primary_key: true
+
+  - name: Status
+    type: VARCHAR
+
+  - name: Metric
+    type: VARCHAR
+    primary_key: true
+
+  - name: Value
+    type: FLOAT

@@ -1,12 +1,5 @@
 """
-One-shot scraper for pizzint.watch.
-Run directly to test: python scraper.py
-Import run_once() in runner.py for scheduled use.
-
-Sections: Pizza, PolyPulse Bilateral Threat Monitor, Nothing Ever Happens Index, Gay Bar Report.
-Pizza/Gay Bar status: Closed/Spike/Quiet — Spike confirmed once stores go live.
-Gay Bar live title format: unknown while closed; LIVE rows added with Value=None when open.
-All timestamps use local machine time.
+scraper for pizzint.watch — Pizza, PolyPulse, NEH Index, Gay Bar.
 """
 import logging
 import requests
@@ -76,7 +69,7 @@ def neh_status(price):
 
 
 def pizza_status(place):
-    """Derive pizza status from API fields. To be reviewed once stores go live."""
+    """Closed / Spike / Quiet from API boolean fields."""
     if place.get('is_closed_now'):
         return 'Closed'
     if place.get('is_spike'):
@@ -156,7 +149,7 @@ def scrape_polypulse():
 
 
 def scrape_neh():
-    """Return DataFrame with one row per prediction market from the NEH doomsday index."""
+    """Return DataFrame with one row per NEH doomsday prediction market."""
     r = session.get(f'{BASE}/api/neh-index/doomsday')
     r.raise_for_status()
     markets = r.json().get('markets') or []
@@ -194,22 +187,23 @@ def _fetch_gay_bar_html():
             (By.XPATH, "//button[@title='Gay Bar Report']")
         ))
         driver.execute_script('arguments[0].click();', btn)
-        # Wait until at least one popular-times chart has finished rendering
         wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, '[data-pt-state="ready"]')
+            (By.CSS_SELECTOR, '[data-pt-chart]')
         ))
+        # LIVE bar loads async after chart renders — wait up to 5s then proceed either way
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, '[title*="LIVE:"]'))
+            )
+        except Exception:
+            pass
         return driver.page_source
     finally:
         driver.quit()
 
 
 def scrape_gay_bar(now):
-    """Return DataFrame for Gay Bar Report parsed from Selenium-rendered HTML.
-
-    Baseline value: scraped from bar chart title attributes ('6p • Historical: 39%').
-    Live value: title format unknown while bars are closed — Value=None until confirmed.
-    Gay Bar cards are identified by the rainbow-border CSS class (pizza cards lack it).
-    """
+    """Return DataFrame for Gay Bar Report from Selenium-rendered HTML."""
     hlabel = hour_label(now.hour)
     # HTML chart titles use short suffix: '6p' not '6pm', '12a' not '12am'
     html_hour = f"{now.hour % 12 or 12}{'a' if now.hour < 12 else 'p'}"
@@ -229,10 +223,9 @@ def scrape_gay_bar(now):
             continue
         name = name_tag.text.strip()
 
-        # 'text-gray-300 font-bold' span holds the status badge text (CLOSED / QUIET / SPIKE)
-        badge = card.select_one('span.text-gray-300.font-bold')
+        # font-bold span inside the status div — color class changes when open so we skip it
+        badge = card.select_one('span.font-bold')
         status = badge.text.strip().title() if badge else 'Unknown'
-        is_closed = status.lower() == 'closed'
 
         # Parse baseline from title like "6p • Historical: 39%"
         baseline_val = None
@@ -251,11 +244,18 @@ def scrape_gay_bar(now):
             'Status': status, 'Value': baseline_val,
         })
 
-        # Live row only when open; Value=None until we confirm the live title format
-        if not is_closed:
+        # LIVE bar is a red overlay div with title "1a • LIVE: 35%" — check chart not badge
+        live_el = card.select_one('[title*="LIVE:"]')
+        if live_el:
+            t = live_el.get('title', '')
+            try:
+                pct_str = t.split('LIVE:')[1].strip().rstrip('%')
+                live_val = round(int(pct_str) / 100, 4)
+            except (IndexError, ValueError):
+                live_val = None
             rows.append({
                 'Section': 'Gay Bar Report', 'DataName': f'{name}_{hlabel}_LIVE',
-                'Status': status, 'Value': None,
+                'Status': status, 'Value': live_val,
             })
 
     logging.info(f'Gay Bar: {len(rows)} rows')
@@ -271,8 +271,8 @@ def run_once():
         ignore_index=True,
     )
 
-    df['DataDate'] = f'{now.month}/{now.day}/{now.year}'
-    df['Time'] = f'{now.hour % 12 or 12}:{now.strftime("%M")}{"am" if now.hour < 12 else "pm"}'
+    df['DataDate'] = now.strftime('%Y-%m-%d')   # DATE — ISO 8601, works in SQLite and Snowflake
+    df['Time']     = now.strftime('%H:%M:%S')   # TIME — 24h, works in SQLite and Snowflake
     df['Metric'] = 'Value'
 
     return df[['DataDate', 'Time', 'Section', 'DataName', 'Status', 'Metric', 'Value']]

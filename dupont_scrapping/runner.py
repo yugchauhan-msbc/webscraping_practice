@@ -1,8 +1,7 @@
 """
-Runs the pizzint.watch scraper every 30 minutes and stores results in SQLite.
-Table schema is read from schema.yaml — same pattern used for Snowflake in production.
+Runs the DupontRegistry scraper daily and stores results in SQLite.
 Usage: python runner.py
-Data saved to pizzint_watch.db in the same folder.
+Data saved to dupontregistry.db in the same folder.
 """
 import time
 import sqlite3
@@ -14,9 +13,9 @@ from scraper import run_once
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-DB_PATH       = Path(__file__).parent / 'pizzint_watch.db'
-SCHEMA_PATH   = Path(__file__).parent / 'schema.yaml'
-INTERVAL_MINUTES = 30
+DB_PATH      = Path(__file__).parent / 'dupontregistry.db'
+SCHEMA_PATH  = Path(__file__).parent / 'schema.yaml'
+INTERVAL_SEC = 24 * 60 * 60  # daily
 
 
 def load_schema(path):
@@ -27,9 +26,9 @@ def load_schema(path):
 
 def build_create_sql(schema):
     """Build CREATE TABLE SQL from schema YAML."""
-    table   = schema['table']
-    cols    = schema['columns']
-    pks     = [c['name'] for c in cols if c.get('primary_key')]
+    table    = schema['table']
+    cols     = schema['columns']
+    pks      = [c['name'] for c in cols if c.get('primary_key')]
     col_defs = [f"    {c['name']} {c['type']}" for c in cols]
     col_defs.append(f"    PRIMARY KEY ({', '.join(pks)})")
     return f"CREATE TABLE IF NOT EXISTS {table} (\n" + ",\n".join(col_defs) + "\n)"
@@ -37,8 +36,8 @@ def build_create_sql(schema):
 
 def build_insert_sql(schema):
     """Build INSERT OR IGNORE SQL from schema YAML."""
-    table  = schema['table']
-    cols   = [c['name'] for c in schema['columns']]
+    table = schema['table']
+    cols  = [c['name'] for c in schema['columns']]
     return (
         f"INSERT OR IGNORE INTO {table} ({', '.join(cols)}) "
         f"VALUES ({', '.join(':' + c for c in cols)})"
@@ -46,7 +45,7 @@ def build_insert_sql(schema):
 
 
 def get_connection(schema):
-    """Return a SQLite connection and ensure the table exists."""
+    """Return SQLite connection with table created."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute(build_create_sql(schema))
     conn.commit()
@@ -54,13 +53,13 @@ def get_connection(schema):
 
 
 def save_to_db(conn, insert_sql, df):
-    """Insert DataFrame rows; skip any that already exist (same primary key)."""
+    """Insert rows — skip duplicates on primary key."""
     conn.executemany(insert_sql, df.to_dict('records'))
     conn.commit()
 
 
 if __name__ == '__main__':
-    logging.info('Starting pizzint.watch runner...')
+    logging.info('Starting DupontRegistry runner...')
     schema     = load_schema(SCHEMA_PATH)
     conn       = get_connection(schema)
     insert_sql = build_insert_sql(schema)
@@ -70,7 +69,7 @@ if __name__ == '__main__':
         try:
             df = run_once()
             save_to_db(conn, insert_sql, df)
-            logging.info(f'Saved {len(df)} rows — next run in {INTERVAL_MINUTES} min')
+            logging.info(f'Saved {len(df)} rows — next run in 24h')
         except Exception as e:
             logging.error(f'Run failed — {e}')
-        time.sleep(INTERVAL_MINUTES * 60)
+        time.sleep(INTERVAL_SEC)

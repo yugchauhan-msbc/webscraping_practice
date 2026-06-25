@@ -1,0 +1,63 @@
+table: DUPONTREGISTRY
+
+columns:
+  - name: DataDate
+    type: DATE
+    primary_key: true
+
+  - name: Price
+    type: FLOAT
+
+  - name: Condition
+    type: VARCHAR
+    primary_key: true
+
+  - name: Listing
+    type: VARCHAR
+    primary_key: true
+
+  - name: Vehicle
+    type: VARCHAR
+    primary_key: true
+
+  - name: Make
+    type: VARCHAR
+
+  - name: Model
+    type: VARCHAR
+
+  - name: VIN
+    type: VARCHAR
+
+  - name: Stock
+    type: VARCHAR
+
+  - name: Year
+    type: VARCHAR
+
+  - name: Mileage
+    type: VARCHAR
+
+  - name: BodyStyle
+    type: VARCHAR
+
+  - name: Engine
+    type: VARCHAR
+
+  - name: EngineType
+    type: VARCHAR
+
+  - name: Transmission
+    type: VARCHAR
+
+  - name: DriveTrain
+    type: VARCHAR
+
+  - name: InteriorColor
+    type: VARCHAR
+
+  - name: ExteriorColor
+    type: VARCHAR
+
+  - name: Dealer
+    type: VARCHAR

@@ -4,21 +4,81 @@ A field-by-field guide to each scraping section — what source is used, how eac
 
 ---
 
+## Project Structure
+
+```
+pizzaint_scrapping/
+├── scraper.py    — data collection, returns a DataFrame
+├── runner.py     — scheduler, reads schema.yaml, writes to SQLite
+└── schema.yaml   — table definition (single source of truth for columns, types, PKs)
+```
+
+The table schema lives in `schema.yaml` — the same pattern used when moving to Snowflake in production. `runner.py` reads the YAML to build the `CREATE TABLE` and `INSERT` SQL dynamically, so no SQL needs changing when the destination changes.
+
+---
+
 ## Output Schema
 
-Every row written to SQLite has these columns:
+Defined in `schema.yaml` and applied by `runner.py`:
 
-| Column       | Type | Description |
-|--------------|------|-------------|
-| `DataDate` ⁱ | TEXT | Scrape date — local machine time, e.g. `6/24/2026` |
-| `Time` ⁱ     | TEXT | Scrape time — 12h format, e.g. `6:30pm` |
-| `Section` ⁱ  | TEXT | Pizza · PolyPulse - Bilateral Threat Monitor · Nothing Ever Happens Index · Gay Bar Report |
-| `DataName` ⁱ | TEXT | Place/pair/market identifier, includes hour label |
-| `Status`     | TEXT | Human-readable state — varies per section |
-| `Metric` ⁱ   | TEXT | Always `Value` — reserved for future metric types |
-| `Value`      | REAL | The numeric measurement |
+| Column       | Type    | Description |
+|--------------|---------|-------------|
+| `DataDate` ⁱ | DATE    | Scrape date — ISO 8601, e.g. `2026-06-25` |
+| `Time` ⁱ     | TIME    | Scrape time — 24h, e.g. `18:30:00` |
+| `Section` ⁱ  | VARCHAR | Pizza · PolyPulse - Bilateral Threat Monitor · Nothing Ever Happens Index · Gay Bar Report |
+| `DataName` ⁱ | VARCHAR | Place/pair/market identifier, includes hour label |
+| `Status`     | VARCHAR | Human-readable state — varies per section |
+| `Metric` ⁱ   | VARCHAR | Always `Value` — reserved for future metric types |
+| `Value`      | FLOAT   | The numeric measurement |
 
 > ⁱ = part of the composite primary key. Rows with the same key are silently skipped (`INSERT OR IGNORE`).
+
+### schema.yaml
+
+```yaml
+table: PIZZINT_WATCH
+
+columns:
+  - name: DataDate
+    type: DATE
+    primary_key: true
+  - name: Time
+    type: TIME
+    primary_key: true
+  - name: Section
+    type: VARCHAR
+    primary_key: true
+  - name: DataName
+    type: VARCHAR
+    primary_key: true
+  - name: Status
+    type: VARCHAR
+  - name: Metric
+    type: VARCHAR
+    primary_key: true
+  - name: Value
+    type: FLOAT
+```
+
+### How runner.py uses the YAML
+
+```python
+def build_create_sql(schema):
+    table    = schema['table']
+    cols     = schema['columns']
+    pks      = [c['name'] for c in cols if c.get('primary_key')]
+    col_defs = [f"    {c['name']} {c['type']}" for c in cols]
+    col_defs.append(f"    PRIMARY KEY ({', '.join(pks)})")
+    return f"CREATE TABLE IF NOT EXISTS {table} (\n" + ",\n".join(col_defs) + "\n)"
+
+def build_insert_sql(schema):
+    table = schema['table']
+    cols  = [c['name'] for c in schema['columns']]
+    return (
+        f"INSERT OR IGNORE INTO {table} ({', '.join(cols)}) "
+        f"VALUES ({', '.join(':' + c for c in cols)})"
+    )
+```
 
 ---
 
@@ -178,11 +238,13 @@ The Gay Bar tab is a client-side view — clicking it renders cards in the brows
 | Field | How |
 |-------|-----|
 | `DataName` | Bar name from `<h3>` text + hour label, e.g. `FREDDIE'S BEACH BAR_9pm` |
-| `Status` | Text from `<span class="text-gray-300 font-bold">` — the badge the user sees. Title-cased: `Closed`, `Quiet`, `Spike` |
+| `Status` | Text from `<span class="font-bold">` inside the card — the badge the user sees. Color class is skipped because it changes when bars are open. Title-cased: `Closed`, `Quiet`, `Spike` |
 | `Value` (baseline) | Each chart bar has a `title` attribute like `"6p • Historical: 39%"`. We find the bar matching the current hour and parse the percentage → ÷100 |
-| `Value` (live) | LIVE row added when open, but live title format is unknown (bars always closed during dev). Value stored as `None` until confirmed |
+| `Value` (live) | Parsed from the red overlay bar's title: `"1a • LIVE: 35%"` → `0.35`. This is a separate div overlaid on the historical bar — appears even when the badge says CLOSED (bar past closing time but people still inside) |
 
 > **Hour format difference:** HTML chart titles use short suffix — `6p` not `6pm`, `12a` not `12am`. We generate `html_hour` separately from our display `hlabel`.
+
+> **Live detection:** We check for `[title*="LIVE:"]` in the chart, NOT the status badge. The badge can say CLOSED while live foot traffic data is still present.
 
 ### Code
 
@@ -197,9 +259,11 @@ btn = wait.until(EC.element_to_be_clickable(
 ))
 driver.execute_script('arguments[0].click();', btn)
 
-# Wait until at least one chart has finished rendering
+# Wait for data-pt-chart attribute — present regardless of live/ready state.
+# We intentionally avoid data-pt-state="ready" because when bars are open/live
+# the state attribute changes to a different value and the wait would time out.
 wait.until(EC.presence_of_element_located(
-    (By.CSS_SELECTOR, '[data-pt-state="ready"]')
+    (By.CSS_SELECTOR, '[data-pt-chart]')
 ))
 html = driver.page_source
 ```
@@ -214,7 +278,11 @@ html_hour = f"{now.hour % 12 or 12}{'a' if now.hour < 12 else 'p'}"
 for card in soup.select('div.rainbow-border'):   # Gay Bar cards only
 
     name   = card.select_one('h3').text.strip()
-    badge  = card.select_one('span.text-gray-300.font-bold')
+
+    # We use span.font-bold without the color class (e.g. text-gray-300) because
+    # when a bar is open the badge uses a different color class (green, orange etc.)
+    # and the color-specific selector would return None.
+    badge  = card.select_one('span.font-bold')
     status = badge.text.strip().title()           # 'CLOSED' → 'Closed'
 
     # Find bar whose title starts with current hour, e.g. "6p • Historical: 39%"
@@ -225,41 +293,44 @@ for card in soup.select('div.rainbow-border'):   # Gay Bar cards only
             pct_str      = t.split('Historical:')[1].strip().rstrip('%')
             baseline_val = round(int(pct_str) / 100, 4)
             break
+
+    # Live row: red overlay bar has title like "1a • LIVE: 35%"
+    # We look for it in the whole card — not tied to current hour, appears on whichever
+    # hour has live data. Also NOT gated on status badge — badge can say CLOSED while
+    # real-time foot traffic data is still present (people still inside past closing time).
+    live_el = card.select_one('[title*="LIVE:"]')
+    if live_el:
+        t       = live_el.get('title', '')          # "1a • LIVE: 35%"
+        pct_str = t.split('LIVE:')[1].strip().rstrip('%')
+        live_val = round(int(pct_str) / 100, 4)
+        rows.append({'Section': 'Gay Bar Report', 'DataName': f'{name}_{hlabel}_LIVE',
+                     'Status': status, 'Value': live_val})
 ```
 
 ---
 
 ## runner.py — Scheduling & Storage
 
-Imports `run_once()` from `scraper.py`, stores every result in SQLite, and loops every 30 minutes.
+Imports `run_once()` from `scraper.py`, reads `schema.yaml` to build the table, stores every result in SQLite, and loops every 30 minutes.
 
 **Flow:**
 ```
-run_once() → DataFrame (all sections) → INSERT OR IGNORE → SQLite → sleep 30 min → repeat
+schema.yaml → build SQL → create table → run_once() → DataFrame → INSERT OR IGNORE → SQLite → sleep 30 min → repeat
 ```
 
-**Table definition:**
-```sql
-CREATE TABLE IF NOT EXISTS PIZZINT_WATCH (
-    DataDate TEXT,
-    Time     TEXT,
-    Section  TEXT,
-    DataName TEXT,
-    Status   TEXT,
-    Metric   TEXT,
-    Value    REAL,
-    PRIMARY KEY (DataDate, Time, Section, DataName, Metric)
-)
-```
+**The CREATE TABLE and INSERT SQL are built dynamically from schema.yaml** — no SQL is hardcoded in runner.py. This means when moving to Snowflake, only the connection changes, not the schema definition.
 
-**Save function — INSERT OR IGNORE skips any row already stored:**
+**Full runner loop:**
 ```python
-conn.executemany(
-    """INSERT OR IGNORE INTO PIZZINT_WATCH
-           (DataDate, Time, Section, DataName, Status, Metric, Value)
-           VALUES (:DataDate, :Time, :Section, :DataName, :Status, :Metric, :Value)""",
-    df.to_dict('records'),
-)
+schema     = load_schema(SCHEMA_PATH)   # reads schema.yaml
+conn       = get_connection(schema)     # creates table if not exists
+insert_sql = build_insert_sql(schema)   # builds INSERT OR IGNORE statement
+
+while True:
+    df = run_once()
+    conn.executemany(insert_sql, df.to_dict('records'))
+    conn.commit()
+    time.sleep(INTERVAL_MINUTES * 60)
 ```
 
 > **Note:** Gay Bar opens a Chrome window every 30 minutes. It appears briefly, scrapes, then closes automatically. This is expected — headless mode is disabled so you can see it working.

@@ -69,12 +69,39 @@ def neh_status(price):
 
 
 def pizza_status(place):
-    """Closed / Spike / Quiet from API boolean fields."""
+    """Fallback status from API booleans — used when page scrape fails."""
     if place.get('is_closed_now'):
         return 'Closed'
     if place.get('is_spike'):
         return 'Spike'
     return 'Quiet'
+
+
+def _fetch_pizza_html():
+    """Selenium-load the main page (pizza is the default tab) and return page source."""
+    driver = _create_driver()
+    try:
+        driver.get(BASE)
+        WebDriverWait(driver, 25).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, '[data-place-id]'))
+        )
+        return driver.page_source
+    finally:
+        driver.quit()
+
+
+def _parse_pizza_statuses(html):
+    """Extract {place_name: status} from rendered pizza card HTML."""
+    soup = BeautifulSoup(html, 'html.parser')
+    statuses = {}
+    for card in soup.select('[data-place-id]'):
+        # Skip inner chart divs — they have data-pt-chart but no h3 of their own
+        name_tag = card.select_one('h3')
+        badge = card.select_one('span.font-bold')
+        if not name_tag or not badge:
+            continue
+        statuses[name_tag.text.strip()] = badge.text.strip().title()
+    return statuses
 
 
 def hour_label(hour):
@@ -88,6 +115,13 @@ def scrape_pizza(now):
     r.raise_for_status()
     places = r.json().get('data') or []
 
+    try:
+        page_statuses = _parse_pizza_statuses(_fetch_pizza_html())
+        logging.info(f'Pizza page statuses: {page_statuses}')
+    except Exception as e:
+        logging.warning(f'Pizza page status scrape failed — {e}; falling back to API fields')
+        page_statuses = {}
+
     hlabel = hour_label(now.hour)
     # baseline_popular_times uses Google's day convention: 0=Sunday
     # Python weekday() is 0=Monday, so: Sun(6)→'0', Mon(0)→'1', etc.
@@ -96,7 +130,7 @@ def scrape_pizza(now):
     rows = []
     for p in places:
         name = p.get('name', '')
-        status = pizza_status(p)
+        status = page_statuses.get(name) or pizza_status(p)
 
         day_data = (p.get('baseline_popular_times') or {}).get(google_day) or []
         hour_entry = next((h for h in day_data if h.get('hour') == now.hour), None)

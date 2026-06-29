@@ -1,58 +1,43 @@
 """
 Scraper for dupontregistry.com — used Ferrari listings (dealer + private).
-
-All columns come from a single GraphQL call to api-gateway.dupontregistry.com/graphql.
-The modification object exposes bodyType, engine, transmissionName, driveTrainName,
-and fuelTypeAlias — no page scraping needed.
-
-Run directly → saves a dated CSV. Import run_once() in runner.py for daily DB runs.
 """
 import logging
-import re
 import time
-import warnings
 from datetime import date
-
+import numpy as np
 import requests
 import pandas as pd
-from urllib3.exceptions import InsecureRequestWarning
-
-warnings.filterwarnings('ignore', category=InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
 GATEWAY         = 'https://api-gateway.dupontregistry.com/graphql'
-PAGE_SIZE       = 100
-LISTING_CONFIGS = [('used', 'dealer'), ('used', 'private')]
+BRAND           = 'ferrari'
+PAGE_SIZE       = 100  # gateway hard cap — sending more still returns 100
+LISTING_CONFIGS = [('new', 'dealer'), ('used', 'private')]
 
-# Gateway uses a self-signed cert in the chain
-_SSL_VERIFY = False
-
+# Browser-like headers required to pass Cloudflare on the gateway
 _HEADERS = {
-    'Content-Type':      'application/json',
-    'Accept':            'application/json',
-    'Origin':            'https://www.dupontregistry.com',
-    'Referer':           'https://www.dupontregistry.com/',
-    'User-Agent':        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-    'sec-ch-ua':         '"Google Chrome";v="149", "Chromium";v="149", "Not/A)Brand";v="24"',
-    'sec-ch-ua-mobile':  '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest':    'empty',
-    'sec-fetch-mode':    'cors',
-    'sec-fetch-site':    'cross-site',
+    'Content-Type':       'application/json',
+    'Accept':             'application/json',
+    # 'Origin':             'https://www.dupontregistry.com',
+    # 'Referer':            'https://www.dupontregistry.com/',
+    'User-Agent':         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
 }
 
 _LISTING_QUERY = """
-query SearchCars($limit: Int, $offset: Int, $condition: String, $listingType: String) {
+query SearchCars(
+  $brand: String, $condition: String, $listingType: String,
+  $limit: Int, $offset: Int
+) {
   cars(
     limit: $limit
     offset: $offset
     source: "es"
-    includes: ["brand", "model", "dealer", "condition",
+    includes: ["brand", "model", "dealer",
                "exteriorColor", "interiorColor", "modification"]
     filters: {
-      brandAlias:    { eq: "ferrari" }
+      brandAlias:    { eq: $brand }
       conditionCode: { eq: $condition }
       listingType:   { eq: $listingType }
     }
@@ -62,15 +47,9 @@ query SearchCars($limit: Int, $offset: Int, $condition: String, $listingType: St
     ]
   ) {
     data {
-      id
-      vin
-      stock
-      year
-      price
-      mileage
-      brand         { name alias }
-      model         { name alias }
-      condition     { code }
+      vin stock year price mileage
+      brand         { name }
+      model         { name }
       dealer        { name }
       exteriorColor { name }
       interiorColor { name }
@@ -88,19 +67,6 @@ query SearchCars($limit: Int, $offset: Int, $condition: String, $listingType: St
 }
 """
 
-_DRIVETRAIN_MAP = {
-    'rwd': 'RWD', 'rear': 'RWD',
-    'awd': 'AWD', 'all-wheel': 'AWD', 'all wheel': 'AWD',
-    'fwd': 'FWD', 'front': 'FWD',
-    '4wd': '4WD', '4x4': '4WD',
-}
-
-_FUELTYPE_MAP = {
-    'petrol': 'Gas', 'gasoline': 'Gas', 'gas': 'Gas',
-    'electric': 'Electric', 'diesel': 'Diesel',
-    'hybrid': 'Hybrid', 'plug-in hybrid': 'Plug-in Hybrid',
-}
-
 COLUMNS = [
     'DataDate', 'Price', 'Condition', 'Listing', 'Vehicle',
     'Make', 'Model', 'VIN', 'Stock', 'Year', 'Mileage',
@@ -109,31 +75,28 @@ COLUMNS = [
 ]
 
 
-# ── Session ───────────────────────────────────────────────────────────────────
-
 def make_session():
-    """Return a requests.Session with browser-like headers."""
+    """Return a requests.Session with the headers needed to reach the gateway."""
     s = requests.Session()
     s.headers.update(_HEADERS)
     return s
 
 
-# ── Pagination ────────────────────────────────────────────────────────────────
-
 def fetch_listing_page(session, condition, listing_type, offset=0):
-    """POST one page of listings to the gateway. Returns (cars_list, pagination_dict)."""
+    """POST one page to the gateway. Returns (cars_list, pagination_dict)."""
     payload = {
         'query':     _LISTING_QUERY,
         'variables': {
-            'limit':       PAGE_SIZE,
-            'offset':      offset,
+            'brand':       BRAND,
             'condition':   condition,
             'listingType': listing_type,
+            # 'limit':       PAGE_SIZE,
+            'offset':      offset,
         },
     }
     for attempt in range(3):
         try:
-            resp = session.post(GATEWAY, json=payload, timeout=60, verify=_SSL_VERIFY)
+            resp = session.post(GATEWAY, json=payload, timeout=60)
             break
         except requests.exceptions.Timeout:
             if attempt == 2:
@@ -147,12 +110,12 @@ def fetch_listing_page(session, condition, listing_type, offset=0):
     if 'errors' in body:
         raise RuntimeError(f'GraphQL error: {body["errors"]}')
 
-    block = body['data']['cars']
-    return block['data'], block['pagination']
+    block = (body.get('data') or {}).get('cars') or {}
+    return block.get('data') or [], block.get('pagination') or {}
 
 
 def fetch_all_listings(session, condition, listing_type):
-    """Page through all listings for one condition+type combo. Returns a flat list."""
+    """Paginate through all listings for one condition + listing_type. Returns a flat list."""
     cars, offset = [], 0
     while True:
         page, pagination = fetch_listing_page(session, condition, listing_type, offset)
@@ -160,54 +123,18 @@ def fetch_all_listings(session, condition, listing_type):
                  condition, listing_type, offset, len(page), pagination['total'])
         cars.extend(page)
         offset += len(page)
-        if not pagination.get('hasMore') or len(page) == 0 or offset >= pagination['total']:
+        if not pagination.get('hasMore') or not page:
             break
-        time.sleep(0.3)
     return cars
 
 
-# ── Field normalisation ───────────────────────────────────────────────────────
-
 def _norm(raw):
-    """Return None for blank/Unspecified values, otherwise return stripped string."""
+    """Return np.nan for blank or Unspecified values, otherwise return the stripped string."""
     if not raw:
-        return None
+        return np.nan
     s = str(raw).strip()
-    return None if s.lower() in ('unspecified', 'none', '') else s
+    return np.nan if s.lower() in ('unspecified', 'none', '') else s
 
-
-def _norm_drivetrain(raw):
-    """Map raw driveTrainName to RWD/AWD/FWD/4WD, or None."""
-    val = _norm(raw)
-    if not val:
-        return None
-    lower = val.lower()
-    for key, out in _DRIVETRAIN_MAP.items():
-        if key in lower:
-            return out
-    return val
-
-
-def _norm_fueltype(raw):
-    """Map raw fuelTypeAlias to Gas/Electric/Diesel/Hybrid, or None."""
-    val = _norm(raw)
-    if not val:
-        return None
-    return _FUELTYPE_MAP.get(val.lower(), val)
-
-
-def _parse_price(raw):
-    """Convert price to float. Returns None for 0 or missing (contact-for-price)."""
-    if not raw:
-        return None
-    try:
-        val = float(re.sub(r'[^\d.]', '', str(raw)))
-        return val or None
-    except ValueError:
-        return None
-
-
-# ── Row mapping ───────────────────────────────────────────────────────────────
 
 def _map_car(car, condition, listing, today):
     """Map one raw API car dict to a schema-row dict."""
@@ -216,12 +143,11 @@ def _map_car(car, condition, listing, today):
     model = (car.get('model') or {}).get('name') or ''
     mod   = car.get('modification') or {}
 
-    # bodyStyleName is populated for private listings; bodyType for dealer listings
-    body_style = _norm(mod.get('bodyStyleName')) or _norm(mod.get('bodyType'))
+    body_style = _norm(mod.get('bodyStyleName'))
 
     return {
         'DataDate':      today,
-        'Price':         _parse_price(car.get('price')),
+        'Price':         float(car['price']) if car.get('price') else np.nan,
         'Condition':     condition,
         'Listing':       listing,
         'Vehicle':       f'{year} {make} {model}'.strip(),
@@ -235,17 +161,15 @@ def _map_car(car, condition, listing, today):
         'InteriorColor': (car.get('interiorColor') or {}).get('name'),
         'Dealer':        (car.get('dealer')        or {}).get('name'),
         'Engine':        _norm(mod.get('engine')),
-        'BodyStyle':     body_style,
+        'BodyStyle':     body_style if pd.notna(body_style) else _norm(mod.get('bodyType')),
         'Transmission':  _norm(mod.get('transmissionName')),
-        'DriveTrain':    _norm_drivetrain(mod.get('driveTrainName')),
-        'EngineType':    _norm_fueltype(mod.get('fuelTypeAlias')),
+        'DriveTrain':    _norm(mod.get('driveTrainName')),
+        'EngineType':    _norm(mod.get('fuelTypeAlias')),
     }
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 def run_once():
-    """Fetch all listings with specs and return a combined DataFrame."""
+    """Fetch all listings and return a combined DataFrame."""
     today   = date.today().strftime('%Y-%m-%d')
     session = make_session()
     all_cars = []
@@ -262,10 +186,7 @@ def run_once():
 
     rows = [_map_car(c, c['_condition'], c['_listing'], today) for c in all_cars]
     df   = pd.DataFrame(rows) if rows else pd.DataFrame(columns=COLUMNS)
-    for col in COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-
+    df   = df.fillna(np.nan)
     log.info('Total: %d rows', len(df))
     return df[COLUMNS]
 

@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 GATEWAY         = 'https://api-gateway.dupontregistry.com/graphql'
 BRAND           = 'ferrari'
 PAGE_SIZE       = 100  # gateway hard cap — sending more still returns 100
-LISTING_CONFIGS = [('new', 'dealer'), ('used', 'private')]
+LISTING_CONFIGS = [('used', 'dealer'), ('used', 'private')]
 
 # Browser-like headers required to pass Cloudflare on the gateway
 _HEADERS = {
@@ -123,6 +123,8 @@ def fetch_all_listings(session, condition, listing_type):
                  condition, listing_type, offset, len(page), pagination['total'])
         cars.extend(page)
         offset += len(page)
+        if 'hasMore' not in pagination:
+            raise KeyError("pagination.hasMore missing")
         if not pagination.get('hasMore') or not page:
             break
     return cars
